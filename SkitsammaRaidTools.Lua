@@ -558,7 +558,8 @@ end
 
 local function OnReadyCheckFinished()
     -- Ready check has ended
-    HideReadyCheckFrame()
+    -- Frame remains open for manual close
+    ReadyCheckInProgress = false
 end
 
 local function OnGroupRosterUpdate()

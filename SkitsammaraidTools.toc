@@ -1,0 +1,8 @@
+## Interface: 120001
+## Title: SkitsammaRaidTools
+## Author: SkitsammaRaidTools
+## Version: 1.0.0
+## Notes: Shows raid lockout status during ready checks with addon communication
+## SavedVariables: SkitsammaRaidToolsDB
+
+SkitsammaRaidTools.lua

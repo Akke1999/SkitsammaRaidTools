@@ -4,6 +4,7 @@
     This addon displays raid lockout information during ready checks.
     It uses inter-addon communication (CHAT_MSG_ADDON) to share lockout data
     between players who have the addon installed.
+    More to come in the future, but this is a solid foundation for the core functionality.
     
     BLIZZARD POLICY COMPLIANCE NOTES:
     - Only shares the player's OWN lockout data voluntarily
@@ -20,14 +21,15 @@ local MESSAGE_RATE_LIMIT = 8.0 -- seconds
 local DATA_EXPIRY = 30.0 -- seconds
 local MAX_BOSSES = 8
 
--- Difficulty IDs for raid tiers (Normal, Heroic, Mythic)
+-- Difficulty IDs for current retail raid tiers
 local RAID_DIFFICULTIES = {
-    normal = 3,
-    heroic = 4,
-    mythic = 5
+    lfr = 17,
+    normal = 14,
+    heroic = 15,
+    mythic = 16
 }
 
-local DEFAULT_DIFFICULTY = "normal"
+local DEFAULT_DIFFICULTY = "lfr"
 local CURRENT_DIFFICULTY = DEFAULT_DIFFICULTY
 
 -- Current state
@@ -38,6 +40,9 @@ local CurrentReadyCheck = nil
 local MainFrame = nil
 local ReadyCheckInProgress = false
 local WaitingForInstanceInfo = false
+
+local RefreshPlayerList
+local HideReadyCheckFrame
 
 -- Raid boss configuration (current raid tier)
 -- For April 2026, assuming latest raid with 8 bosses
@@ -118,12 +123,19 @@ local function UpdateTitle()
         return
     end
 
-    local prettyDifficulty = string.upper(string.sub(CURRENT_DIFFICULTY, 1, 1)) .. string.sub(CURRENT_DIFFICULTY, 2)
+    local prettyDifficulty
+    if CURRENT_DIFFICULTY == "lfr" then
+        prettyDifficulty = "LFR"
+    else
+        prettyDifficulty = string.upper(string.sub(CURRENT_DIFFICULTY, 1, 1)) .. string.sub(CURRENT_DIFFICULTY, 2)
+    end
     MainFrame.titleString:SetText("Raid Lockout Status (" .. prettyDifficulty .. ")")
 end
 
 local function GetDifficultyLetter()
-    if CURRENT_DIFFICULTY == "normal" then
+    if CURRENT_DIFFICULTY == "lfr" then
+        return "L"
+    elseif CURRENT_DIFFICULTY == "normal" then
         return "N"
     elseif CURRENT_DIFFICULTY == "heroic" then
         return "H"
@@ -133,43 +145,66 @@ local function GetDifficultyLetter()
     return "N"
 end
 
-local function DetectRaidDifficulty()
-    if not IsInRaid() then
-        return
+local function GetDifficultyNameFromID(difficultyID)
+    if difficultyID == RAID_DIFFICULTIES.lfr then
+        return "lfr"
+    elseif difficultyID == RAID_DIFFICULTIES.normal then
+        return "normal"
+    elseif difficultyID == RAID_DIFFICULTIES.heroic then
+        return "heroic"
+    elseif difficultyID == RAID_DIFFICULTIES.mythic then
+        return "mythic"
     end
-    
-    local instanceName, instanceType, difficultyID = GetInstanceInfo()
-    
-    if instanceType == "raid" and difficultyID then
-        local newDifficulty
-        if difficultyID == RAID_DIFFICULTIES.normal then
-            newDifficulty = "normal"
-        elseif difficultyID == RAID_DIFFICULTIES.heroic then
-            newDifficulty = "heroic"
-        elseif difficultyID == RAID_DIFFICULTIES.mythic then
-            newDifficulty = "mythic"
-        end
-        
-        if newDifficulty and newDifficulty ~= CURRENT_DIFFICULTY then
-            CURRENT_DIFFICULTY = newDifficulty
-            SkitsammaRaidToolsDB.difficulty = newDifficulty
-            if MainFrame then
-                UpdateTitle()
-                if MainFrame:IsShown() then
-                    RefreshPlayerList()
-                end
+end
+
+local function GetSelectedRaidDifficulty()
+    local _, instanceType, instanceDifficultyID = GetInstanceInfo()
+    if instanceType == "raid" and instanceDifficultyID and instanceDifficultyID > 0 then
+        return instanceDifficultyID
+    end
+
+    if GetRaidDifficultyID then
+        return GetRaidDifficultyID()
+    end
+end
+
+local function IsSupportedRaidDifficulty(difficultyID)
+    return difficultyID == RAID_DIFFICULTIES.lfr
+        or difficultyID == RAID_DIFFICULTIES.normal
+        or difficultyID == RAID_DIFFICULTIES.heroic
+end
+
+local function IsAddonActiveForCurrentGroup()
+    if not IsInRaid() then
+        return false
+    end
+
+    return IsSupportedRaidDifficulty(GetSelectedRaidDifficulty())
+end
+
+local function DetectRaidDifficulty()
+    local difficultyID = GetSelectedRaidDifficulty()
+    local newDifficulty = GetDifficultyNameFromID(difficultyID)
+
+    if newDifficulty and newDifficulty ~= CURRENT_DIFFICULTY then
+        CURRENT_DIFFICULTY = newDifficulty
+        SkitsammaRaidToolsDB.difficulty = newDifficulty
+        if MainFrame then
+            UpdateTitle()
+            if MainFrame:IsShown() then
+                RefreshPlayerList()
             end
-            print("|cFF00FF00SkitsammaRaidTools:|r Auto-detected raid difficulty: " .. string.upper(newDifficulty))
         end
+        print("|cFF00FF00SkitsammaRaidTools:|r Auto-detected raid difficulty: " .. string.upper(newDifficulty))
     end
 end
 
 local function SerializeLockoutData(data)
     -- Simple serialization: "instanceID:boss1,boss2,boss3" for each difficulty
-    -- Format: "{normal:1,2,3}|{heroic:1,2}|{mythic:1}"
+    -- Format: "{lfr:1,2}|{normal:1,2,3}|{heroic:1,2}|{mythic:1}"
     local parts = {}
     for difficulty, bosses in pairs(data) do
-        if difficulty == "normal" or difficulty == "heroic" or difficulty == "mythic" then
+        if difficulty == "lfr" or difficulty == "normal" or difficulty == "heroic" or difficulty == "mythic" then
             local bossStr = table.concat(bosses, ",")
             table.insert(parts, difficulty .. ":" .. bossStr)
         end
@@ -204,6 +239,7 @@ local function UpdateOwnLockoutData()
     local numSavedInstances = GetNumSavedInstances and GetNumSavedInstances() or 0
     local nextPlayerData = {
         instanceName = currentRaidName,
+        lfr = {},
         normal = {},
         heroic = {},
         mythic = {}
@@ -214,7 +250,9 @@ local function UpdateOwnLockoutData()
 
         if name and isRaid and locked then
             local difficultyName
-            if difficultyID == RAID_DIFFICULTIES.normal then
+            if difficultyID == RAID_DIFFICULTIES.lfr then
+                difficultyName = "lfr"
+            elseif difficultyID == RAID_DIFFICULTIES.normal then
                 difficultyName = "normal"
             elseif difficultyID == RAID_DIFFICULTIES.heroic then
                 difficultyName = "heroic"
@@ -458,10 +496,10 @@ local function AddPlayerRow(playerName, class, hasAddon)
     MainFrame.contentFrame:SetHeight(math.max(contentHeight, 1))
 end
 
-local function RefreshPlayerList()
+function RefreshPlayerList()
     ClearPlayerRows()
     
-    if not IsInRaid() then
+    if not IsAddonActiveForCurrentGroup() then
         return
     end
     
@@ -478,6 +516,11 @@ local function RefreshPlayerList()
 end
 
 local function ShowReadyCheckFrame()
+    if not IsAddonActiveForCurrentGroup() then
+        HideReadyCheckFrame()
+        return
+    end
+
     if not MainFrame then
         CreateMainFrame()
     end
@@ -487,7 +530,7 @@ local function ShowReadyCheckFrame()
     ReadyCheckInProgress = true
 end
 
-local function HideReadyCheckFrame()
+function HideReadyCheckFrame()
     if MainFrame then
         MainFrame:Hide()
     end
@@ -505,7 +548,7 @@ local function SerializeOwnData()
 end
 
 local function SendLockoutData(force)
-    if not IsInRaid() and not IsInGroup() then
+    if not IsAddonActiveForCurrentGroup() then
         return
     end
     
@@ -516,9 +559,8 @@ local function SendLockoutData(force)
     end
     
     local data = SerializeOwnData()
-    local channel = IsInRaid() and "RAID" or "PARTY"
-    
-    C_ChatInfo.SendAddonMessage(ADDON_PREFIX, data, channel)
+
+    C_ChatInfo.SendAddonMessage(ADDON_PREFIX, data, "RAID")
     LastMessageTime["broadcast"] = now
 end
 
@@ -531,8 +573,12 @@ local function OnAddonMessage(prefix, message, channel, sender)
         return
     end
     
-    -- Only accept messages from raid/party members
-    if not (channel == "RAID" or channel == "PARTY") then
+    -- Only accept messages from supported raid groups
+    if channel ~= "RAID" then
+        return
+    end
+
+    if not IsAddonActiveForCurrentGroup() then
         return
     end
     
@@ -573,29 +619,33 @@ local function OnAddonLoaded(addonName)
     if not SkitsammaRaidToolsDB then
         SkitsammaRaidToolsDB = {
             framePos = nil,
-            difficulty = "normal"
+            difficulty = DEFAULT_DIFFICULTY
         }
         print("|cFF00FF00SkitsammaRaidTools:|r Created new SavedVariables database.")
     else
-        print("|cFF00FF00SkitsammaRaidTools:|r Loaded existing SavedVariables. Difficulty: " .. (SkitsammaRaidToolsDB.difficulty or "normal"))
+        print("|cFF00FF00SkitsammaRaidTools:|r Loaded existing SavedVariables. Difficulty: " .. (SkitsammaRaidToolsDB.difficulty or DEFAULT_DIFFICULTY))
     end
     
-    CURRENT_DIFFICULTY = SkitsammaRaidToolsDB.difficulty or "normal"
+    CURRENT_DIFFICULTY = SkitsammaRaidToolsDB.difficulty or DEFAULT_DIFFICULTY
     
     -- Register addon communication
     C_ChatInfo.RegisterAddonMessagePrefix(ADDON_PREFIX)
-    
-    -- Create main frame
-    CreateMainFrame()
-    
-    -- Build from any cached info immediately, then ask the server for a fresh copy.
-    UpdateOwnLockoutData()
-    RequestOwnLockoutUpdate()
+
+    DetectRaidDifficulty()
+    if IsAddonActiveForCurrentGroup() then
+        -- Build from any cached info immediately, then ask the server for a fresh copy.
+        UpdateOwnLockoutData()
+        RequestOwnLockoutUpdate()
+    end
 end
 
 local function OnReadyCheck()
     -- A ready check has started
     DetectRaidDifficulty()
+    if not IsAddonActiveForCurrentGroup() then
+        HideReadyCheckFrame()
+        return
+    end
     UpdateOwnLockoutData()
     ShowReadyCheckFrame()
     RequestOwnLockoutUpdate()
@@ -610,6 +660,12 @@ end
 
 local function OnGroupRosterUpdate()
     DetectRaidDifficulty()
+    if not IsAddonActiveForCurrentGroup() then
+        HideReadyCheckFrame()
+        return
+    end
+
+    UpdateOwnLockoutData()
     if MainFrame and MainFrame:IsShown() then
         RefreshPlayerList()
     end
@@ -619,6 +675,9 @@ local function OnEncounterEnd(encounterID, encounterName, difficultyID, groupSiz
     if success then
         -- Ask the server for updated lockout data after a successful kill.
         DetectRaidDifficulty()
+        if not IsAddonActiveForCurrentGroup() then
+            return
+        end
         RequestOwnLockoutUpdate()
     end
 end
@@ -628,10 +687,14 @@ local function OnUpdateInstanceInfo()
     WaitingForInstanceInfo = false
     DetectRaidDifficulty()
     UpdateOwnLockoutData()
+    if not IsAddonActiveForCurrentGroup() then
+        HideReadyCheckFrame()
+        return
+    end
     if MainFrame and MainFrame:IsShown() then
         RefreshPlayerList()
     end
-    if IsInRaid() or IsInGroup() then
+    if IsAddonActiveForCurrentGroup() then
         SendLockoutData(true)
     end
 end
@@ -643,98 +706,13 @@ local function OnPlayerEnteringWorld()
     
     -- Clear cached data when entering world to force refresh
     CachedData = {}
-    
+
+    if not IsAddonActiveForCurrentGroup() then
+        HideReadyCheckFrame()
+        return
+    end
+
     RequestOwnLockoutUpdate()
-end
-
---[[
-    ============================================================
-    TEST FUNCTIONS
-    ============================================================
-]]
-
-local function PopulateTestData()
-    -- Clear existing cached data
-    CachedData = {}
-    
-    -- Test player 1: Has addon, fully progressed on Normal
-    CachedData["TestPlayer1"] = {
-        data = {
-            normal = {1, 2, 3, 4, 5, 6, 7, 8},  -- All bosses killed
-            heroic = {},
-            mythic = {}
-        },
-        timestamp = NowTime()
-    }
-    
-    -- Test player 2: Has addon, partially progressed
-    CachedData["TestPlayer2"] = {
-        data = {
-            normal = {1, 2, 3},  -- First 3 bosses killed
-            heroic = {},
-            mythic = {}
-        },
-        timestamp = NowTime()
-    }
-    
-    -- Test player 3: Has addon, no progress
-    CachedData["TestPlayer3"] = {
-        data = {
-            normal = {},  -- No bosses killed
-            heroic = {},
-            mythic = {}
-        },
-        timestamp = NowTime()
-    }
-    
-    -- Test player 4: Has addon, but data is stale (31 seconds old)
-    CachedData["TestPlayer4"] = {
-        data = {
-            normal = {1, 2},
-            heroic = {},
-            mythic = {}
-        },
-        timestamp = NowTime() - 31.0  -- Stale data
-    }
-    
-    -- Add more test data (without marking them as having addon, for "NO ADDON" display)
-    -- We'll do this by just not adding them to CachedData, then manually create rows for them
-    
-    print("|cFF00FF00SkitsammaRaidTools:|r Test data loaded. Use /rlock test to show frame.")
-end
-
-local function ClearTestData()
-    -- Clear all cached data
-    CachedData = {}
-    
-    if MainFrame and MainFrame:IsShown() then
-        RefreshPlayerList()
-    end
-    
-    print("|cFF00FF00SkitsammaRaidTools:|r Test data cleared.")
-end
-
-local function ShowTestFrame()
-    -- Populate test data first
-    PopulateTestData()
-    
-    -- Create test frame with fake players
-    if not MainFrame then
-        CreateMainFrame()
-    end
-    
-    ClearPlayerRows()
-    
-    -- Add test players
-    AddPlayerRow("TestPlayer1", "WARRIOR", true)
-    AddPlayerRow("TestPlayer2", "PALADIN", true)
-    AddPlayerRow("TestPlayer3", "MAGE", true)
-    AddPlayerRow("TestPlayer4", "ROGUE", true)
-    AddPlayerRow("NoAddonPlayer1", "DRUID", false)  -- No addon
-    AddPlayerRow("NoAddonPlayer2", "PRIEST", false)  -- No addon
-    
-    MainFrame:Show()
-    print("|cFF00FF00SkitsammaRaidTools:|r Test frame displayed. Use /rlock cleartest to clear.")
 end
 
 --[[
@@ -747,55 +725,29 @@ local function HandleSlashCommand(msg)
     msg = string.lower(msg or "")
     
     if msg == "" or msg == "toggle" then
-        if MainFrame:IsShown() then
+        if MainFrame and MainFrame:IsShown() then
             HideReadyCheckFrame()
             print("|cFF00FF00SkitsammaRaidTools:|r Frame hidden.")
         else
-            ShowReadyCheckFrame()
-            print("|cFF00FF00SkitsammaRaidTools:|r Frame shown.")
-        end
-    elseif msg == "normal" then
-        CURRENT_DIFFICULTY = "normal"
-        SkitsammaRaidToolsDB.difficulty = "normal"
-        if MainFrame then
-            UpdateTitle()
-            if MainFrame:IsShown() then
-                RefreshPlayerList()
+            if IsAddonActiveForCurrentGroup() then
+                ShowReadyCheckFrame()
+                print("|cFF00FF00SkitsammaRaidTools:|r Frame shown.")
+            else
+                print("|cFFFF0000SkitsammaRaidTools:|r Inactive outside LFR/Normal/Heroic raid groups.")
             end
         end
-        print("|cFF00FF00SkitsammaRaidTools:|r Difficulty set to Normal. (DB: " .. SkitsammaRaidToolsDB.difficulty .. ")")
-    elseif msg == "heroic" then
-        CURRENT_DIFFICULTY = "heroic"
-        SkitsammaRaidToolsDB.difficulty = "heroic"
-        if MainFrame then
-            UpdateTitle()
-            if MainFrame:IsShown() then
-                RefreshPlayerList()
-            end
-        end
-        print("|cFF00FF00SkitsammaRaidTools:|r Difficulty set to Heroic. (DB: " .. SkitsammaRaidToolsDB.difficulty .. ")")
-    elseif msg == "mythic" then
-        CURRENT_DIFFICULTY = "mythic"
-        SkitsammaRaidToolsDB.difficulty = "mythic"
-        if MainFrame then
-            UpdateTitle()
-            if MainFrame:IsShown() then
-                RefreshPlayerList()
-            end
-        end
-        print("|cFF00FF00SkitsammaRaidTools:|r Difficulty set to Mythic. (DB: " .. SkitsammaRaidToolsDB.difficulty .. ")")
-    elseif msg == "test" then
-        ShowTestFrame()
-    elseif msg == "cleartest" then
-        ClearTestData()
+    elseif msg == "lfr" or msg == "normal" or msg == "heroic" or msg == "mythic" then
+        print("|cFF00FF00SkitsammaRaidTools:|r Difficulty is auto-detected from the current raid difficulty.")
     elseif msg == "status" then
+        local selectedDifficulty = GetDifficultyNameFromID(GetSelectedRaidDifficulty()) or "unknown"
         print("|cFF00FF00SkitsammaRaidTools Status:|r")
         print("  Current Difficulty (runtime): " .. CURRENT_DIFFICULTY)
-        print("  Saved Difficulty (DB): " .. (SkitsammaRaidToolsDB.difficulty or "unknown"))
+        print("  Selected Raid Difficulty: " .. selectedDifficulty)
         print("  In Raid: " .. tostring(IsInRaid()))
+        print("  Active For Current Group: " .. tostring(IsAddonActiveForCurrentGroup()))
         print("  Frame Shown: " .. tostring(MainFrame and MainFrame:IsShown()))
     else
-        print("|cFF00FF00SkitsammaRaidTools:|r Usage: /rlock [toggle|normal|heroic|mythic|test|cleartest|status]")
+        print("|cFF00FF00SkitsammaRaidTools:|r Usage: /rlock [toggle|status]")
     end
 end
 

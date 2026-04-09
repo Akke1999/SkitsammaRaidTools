@@ -119,7 +119,49 @@ local function UpdateTitle()
     end
 
     local prettyDifficulty = string.upper(string.sub(CURRENT_DIFFICULTY, 1, 1)) .. string.sub(CURRENT_DIFFICULTY, 2)
-    MainFrame.titleString:SetText("Automatic (" .. prettyDifficulty .. ")")
+    MainFrame.titleString:SetText("Raid Lockout Status (" .. prettyDifficulty .. ")")
+end
+
+local function GetDifficultyLetter()
+    if CURRENT_DIFFICULTY == "normal" then
+        return "N"
+    elseif CURRENT_DIFFICULTY == "heroic" then
+        return "H"
+    elseif CURRENT_DIFFICULTY == "mythic" then
+        return "M"
+    end
+    return "N"
+end
+
+local function DetectRaidDifficulty()
+    if not IsInRaid() then
+        return
+    end
+    
+    local instanceName, instanceType, difficultyID = GetInstanceInfo()
+    
+    if instanceType == "raid" and difficultyID then
+        local newDifficulty
+        if difficultyID == RAID_DIFFICULTIES.normal then
+            newDifficulty = "normal"
+        elseif difficultyID == RAID_DIFFICULTIES.heroic then
+            newDifficulty = "heroic"
+        elseif difficultyID == RAID_DIFFICULTIES.mythic then
+            newDifficulty = "mythic"
+        end
+        
+        if newDifficulty and newDifficulty ~= CURRENT_DIFFICULTY then
+            CURRENT_DIFFICULTY = newDifficulty
+            SkitsammaRaidToolsDB.difficulty = newDifficulty
+            if MainFrame then
+                UpdateTitle()
+                if MainFrame:IsShown() then
+                    RefreshPlayerList()
+                end
+            end
+            print("|cFF00FF00SkitsammaRaidTools:|r Auto-detected raid difficulty: " .. string.upper(newDifficulty))
+        end
+    end
 end
 
 local function SerializeLockoutData(data)
@@ -392,12 +434,12 @@ local function AddPlayerRow(playerName, class, hasAddon)
                     bossString:SetText("-")
                     bossString:SetTextColor(0.5, 0.5, 0.5)
                 elseif isLocked then
-                    -- Green "N" for not locked (hasn't killed)
-                    bossString:SetText("N")
+                    -- Green for not locked (hasn't killed this boss)
+                    bossString:SetText(GetDifficultyLetter())
                     bossString:SetTextColor(0, 1, 0)
                 else
-                    -- Red "N" for LOCKED (has killed)
-                    bossString:SetText("N")
+                    -- Red for locked (has killed this boss)
+                    bossString:SetText(GetDifficultyLetter())
                     bossString:SetTextColor(1, 0, 0)
                 end
             else
@@ -533,6 +575,9 @@ local function OnAddonLoaded(addonName)
             framePos = nil,
             difficulty = "normal"
         }
+        print("|cFF00FF00SkitsammaRaidTools:|r Created new SavedVariables database.")
+    else
+        print("|cFF00FF00SkitsammaRaidTools:|r Loaded existing SavedVariables. Difficulty: " .. (SkitsammaRaidToolsDB.difficulty or "normal"))
     end
     
     CURRENT_DIFFICULTY = SkitsammaRaidToolsDB.difficulty or "normal"
@@ -550,6 +595,7 @@ end
 
 local function OnReadyCheck()
     -- A ready check has started
+    DetectRaidDifficulty()
     UpdateOwnLockoutData()
     ShowReadyCheckFrame()
     RequestOwnLockoutUpdate()
@@ -563,6 +609,7 @@ local function OnReadyCheckFinished()
 end
 
 local function OnGroupRosterUpdate()
+    DetectRaidDifficulty()
     if MainFrame and MainFrame:IsShown() then
         RefreshPlayerList()
     end
@@ -571,6 +618,7 @@ end
 local function OnEncounterEnd(encounterID, encounterName, difficultyID, groupSize, success)
     if success then
         -- Ask the server for updated lockout data after a successful kill.
+        DetectRaidDifficulty()
         RequestOwnLockoutUpdate()
     end
 end
@@ -578,6 +626,7 @@ end
 local function OnUpdateInstanceInfo()
     -- Fresh saved-instance data is now available from the server.
     WaitingForInstanceInfo = false
+    DetectRaidDifficulty()
     UpdateOwnLockoutData()
     if MainFrame and MainFrame:IsShown() then
         RefreshPlayerList()
@@ -589,6 +638,7 @@ end
 
 local function OnPlayerEnteringWorld()
     -- Player changed zones; rebuild what we can locally and then request a refresh.
+    DetectRaidDifficulty()
     UpdateOwnLockoutData()
     
     -- Clear cached data when entering world to force refresh
@@ -713,7 +763,7 @@ local function HandleSlashCommand(msg)
                 RefreshPlayerList()
             end
         end
-        print("|cFF00FF00SkitsammaRaidTools:|r Difficulty set to Normal.")
+        print("|cFF00FF00SkitsammaRaidTools:|r Difficulty set to Normal. (DB: " .. SkitsammaRaidToolsDB.difficulty .. ")")
     elseif msg == "heroic" then
         CURRENT_DIFFICULTY = "heroic"
         SkitsammaRaidToolsDB.difficulty = "heroic"
@@ -723,7 +773,7 @@ local function HandleSlashCommand(msg)
                 RefreshPlayerList()
             end
         end
-        print("|cFF00FF00SkitsammaRaidTools:|r Difficulty set to Heroic.")
+        print("|cFF00FF00SkitsammaRaidTools:|r Difficulty set to Heroic. (DB: " .. SkitsammaRaidToolsDB.difficulty .. ")")
     elseif msg == "mythic" then
         CURRENT_DIFFICULTY = "mythic"
         SkitsammaRaidToolsDB.difficulty = "mythic"
@@ -733,13 +783,19 @@ local function HandleSlashCommand(msg)
                 RefreshPlayerList()
             end
         end
-        print("|cFF00FF00SkitsammaRaidTools:|r Difficulty set to Mythic.")
+        print("|cFF00FF00SkitsammaRaidTools:|r Difficulty set to Mythic. (DB: " .. SkitsammaRaidToolsDB.difficulty .. ")")
     elseif msg == "test" then
         ShowTestFrame()
     elseif msg == "cleartest" then
         ClearTestData()
+    elseif msg == "status" then
+        print("|cFF00FF00SkitsammaRaidTools Status:|r")
+        print("  Current Difficulty (runtime): " .. CURRENT_DIFFICULTY)
+        print("  Saved Difficulty (DB): " .. (SkitsammaRaidToolsDB.difficulty or "unknown"))
+        print("  In Raid: " .. tostring(IsInRaid()))
+        print("  Frame Shown: " .. tostring(MainFrame and MainFrame:IsShown()))
     else
-        print("|cFF00FF00SkitsammaRaidTools:|r Usage: /rlock [toggle|normal|heroic|mythic|test|cleartest]")
+        print("|cFF00FF00SkitsammaRaidTools:|r Usage: /rlock [toggle|normal|heroic|mythic|test|cleartest|status]")
     end
 end
 
